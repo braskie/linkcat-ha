@@ -12,7 +12,6 @@
     },
     "error": {
       "invalid_auth": "Invalid login or password",
-      "missing_dependency": "Playwright is unavailable in Home Assistant. Restart HA and check logs for dependency install errors.",
       "cannot_connect": "Failed to connect to Linkcat"
     },
     "abort": {
