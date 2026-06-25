@@ -249,13 +249,31 @@ def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutIte
         row_text = _html_to_text(row_html)
         if "click to sort" in row_text.lower():
             continue
-
-        title = _extract_anchor_text(cells[0]) or _extract_anchor_text(cells[1])
+        # Skip header rows (only <th> cells, no <td>)
+        if not re.search(r"<td\b", row_html, re.IGNORECASE):
+            continue
+        title = None
         author = None
-        if len(cells) > 2:
-            parsed_title, parsed_author = _parse_title_author_from_multiline_text(_html_to_text(cells[2]))
-            title = title or parsed_title
-            author = parsed_author
+        title_cell_idx = None
+        for idx, cell in enumerate(cells):
+            anchor = _extract_anchor_text(cell)
+            if anchor and "click to sort" not in anchor.lower():
+                title = anchor
+                title_cell_idx = idx
+                break
+
+        # Fallback: multiline parse across cells
+        if not title:
+            for idx, cell in enumerate(cells):
+                t, a = _parse_title_author_from_multiline_text(_html_to_text(cell))
+                if t and "click to sort" not in t.lower():
+                    title, author = t, a
+                    title_cell_idx = idx
+                    break
+
+        # Extract author from the same cell as the title
+        if title and title_cell_idx is not None and author is None:
+            _, author = _parse_title_author_from_multiline_text(_html_to_text(cells[title_cell_idx]))
 
         if not title:
             title = row_text.split("Shelf Number:", maxsplit=1)[0].strip()
@@ -280,12 +298,43 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
         if len(cells) < 2:
             continue
 
-        title, author = _parse_title_author_from_multiline_text(_html_to_text(cells[1]))
-        if not title:
-            title = _html_to_text(cells[1])
+        row_text = _html_to_text(row_html)
+        if "click to sort" in row_text.lower():
+            continue
+        # Skip header rows (only <th> cells, no <td>)
+        if not re.search(r"<td\b", row_html, re.IGNORECASE):
+            continue
+        title = None
+        author = None
+        title_cell_idx = None
+        for idx, cell in enumerate(cells):
+            anchor = _extract_anchor_text(cell)
+            if anchor and "title/author" not in anchor.lower():
+                title = anchor
+                title_cell_idx = idx
+                break
 
-        status = _html_to_text(cells[2]) if len(cells) > 2 else _html_to_text(row_html)
-        ready = _is_hold_ready(status)
+        # Fallback: multiline parse across cells
+        if not title:
+            for idx, cell in enumerate(cells):
+                t, a = _parse_title_author_from_multiline_text(_html_to_text(cell))
+                if t and "title/author" not in t.lower():
+                    title, author = t, a
+                    title_cell_idx = idx
+                    break
+
+        # Extract author from the same cell as the title
+        if title and title_cell_idx is not None and author is None:
+            _, author = _parse_title_author_from_multiline_text(_html_to_text(cells[title_cell_idx]))
+
+        # Status is the next cell after the title, with cells[2] as a fallback
+        status = None
+        if title_cell_idx is not None and title_cell_idx + 1 < len(cells):
+            status = _html_to_text(cells[title_cell_idx + 1]).strip() or None
+        if not status and len(cells) > 2:
+            status = _html_to_text(cells[2]).strip() or None
+
+        ready = _is_hold_ready(status or row_text)
         image_url = _extract_image_url(row_html, base_url)
 
         if title and "title/author" not in title.lower():
@@ -294,37 +343,173 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
     return _dedupe_holds(holds)
 
 
+def _extract_balanced_tag_content(html: str, tag: str, content_start: int) -> str | None:
+    """Return the content from content_start up to the matching closing tag, handling nesting."""
+    depth = 1
+    pos = content_start
+    open_re = re.compile(rf"<{re.escape(tag)}\b", re.IGNORECASE)
+    close_re = re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE)
+    while depth > 0:
+        open_m = open_re.search(html, pos)
+        close_m = close_re.search(html, pos)
+        if close_m is None:
+            return None
+        if open_m is not None and open_m.start() < close_m.start():
+            depth += 1
+            pos = open_m.end()
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[content_start : close_m.start()]
+            pos = close_m.end()
+    return None
+
+
 def _find_table(account_html: str, id_hints: list[str]) -> str | None:
+    # Primary: look for <table id="...hint..."> and extract its full content,
+    # properly accounting for nested <table> tags so the match is not truncated.
     for id_hint in id_hints:
-        match = re.search(
-            rf"<table[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>(.*?)</table>",
+        open_m = re.search(
+            rf"<table\b[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>",
             account_html,
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.IGNORECASE,
         )
-        if match:
-            return match.group(1)
+        if open_m:
+            content = _extract_balanced_tag_content(account_html, "table", open_m.end())
+            if content is not None:
+                _LOGGER.debug("Found table by id hint '%s'", id_hint)
+                return content
 
-    # Fallback: search for any table within a section div matching id hints.
+    # Fallback: look for a section <div id="...hint..."> and find the first table inside it.
     for id_hint in id_hints:
-        section_match = re.search(
-            rf"<div[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>(.*?)</div>",
+        open_m = re.search(
+            rf"<div\b[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>",
             account_html,
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.IGNORECASE,
         )
-        if section_match:
-            table_match = re.search(r"<table[^>]*>(.*?)</table>", section_match.group(1), flags=re.IGNORECASE | re.DOTALL)
-            if table_match:
-                return table_match.group(1)
+        if open_m:
+            div_content = _extract_balanced_tag_content(account_html, "div", open_m.end())
+            if div_content:
+                table_open_m = re.search(r"<table\b[^>]*>", div_content, flags=re.IGNORECASE)
+                if table_open_m:
+                    content = _extract_balanced_tag_content(div_content, "table", table_open_m.end())
+                    if content is not None:
+                        _LOGGER.debug("Found table via div id hint '%s'", id_hint)
+                        return content
 
+    _LOGGER.debug("No table found for id hints: %s", id_hints)
     return None
 
 
 def _extract_table_rows(table_html: str) -> list[str]:
-    return re.findall(r"<tr\b[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL)
+    """Extract top-level <tr> row contents, skipping rows inside nested <table> elements."""
+    return _extract_direct_tag_contents(table_html, "tr")
 
 
 def _extract_cells(row_html: str) -> list[str]:
-    return re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
+    """Extract top-level <td>/<th> cell contents, skipping cells from nested tables."""
+    # Collect both td and th in document order
+    td_results = _extract_direct_tag_contents(row_html, "td")
+    th_results = _extract_direct_tag_contents(row_html, "th")
+    if not th_results:
+        return td_results
+    if not td_results:
+        return th_results
+
+    # Interleave by finding tag positions
+    combined = []
+    pos = 0
+    td_pat = re.compile(r"<td\b[^>]*>", re.IGNORECASE)
+    th_pat = re.compile(r"<th\b[^>]*>", re.IGNORECASE)
+    td_iter = iter(td_results)
+    th_iter = iter(th_results)
+    next_td = next(td_iter, None)
+    next_th = next(th_iter, None)
+    while True:
+        td_m = td_pat.search(row_html, pos) if next_td is not None else None
+        th_m = th_pat.search(row_html, pos) if next_th is not None else None
+        if td_m is None and th_m is None:
+            break
+        if th_m is None or (td_m is not None and td_m.start() < th_m.start()):
+            combined.append(next_td)
+            next_td = next(td_iter, None)
+            pos = td_m.end()
+        else:
+            combined.append(next_th)
+            next_th = next(th_iter, None)
+            pos = th_m.end()
+    return combined
+
+
+def _extract_direct_tag_contents(html: str, tag: str) -> list[str]:
+    """Extract content of top-level <tag> elements, skipping same-named tags inside nested <table> blocks."""
+    results = []
+    pos = 0
+    open_table_re = re.compile(r"<table\b", re.IGNORECASE)
+    close_table_re = re.compile(r"</table\s*>", re.IGNORECASE)
+    open_tag_re = re.compile(rf"<{re.escape(tag)}\b[^>]*>", re.IGNORECASE)
+    close_tag_re = re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE)
+
+    while pos < len(html):
+        open_table_m = open_table_re.search(html, pos)
+        open_tag_m = open_tag_re.search(html, pos)
+
+        if open_tag_m is None:
+            break
+
+        if open_table_m is not None and open_table_m.start() < open_tag_m.start():
+            # Skip nested table before this tag.
+            nested_content = _extract_balanced_tag_content(html, "table", open_table_m.end())
+            if nested_content is not None:
+                skip_end = open_table_m.end() + len(nested_content)
+                close_m = close_table_re.search(html, skip_end)
+                pos = close_m.end() if close_m else skip_end
+            else:
+                pos = open_table_m.end()
+            continue
+
+        # Extract content up to the matching close tag, skipping nested tables.
+        content = _extract_content_to_close_tag(html, open_tag_m.end(), close_tag_re, close_table_re)
+        if content is not None:
+            results.append(content)
+            end_pos = open_tag_m.end() + len(content)
+            close_m = close_tag_re.search(html, end_pos)
+            pos = close_m.end() if close_m else end_pos
+        else:
+            pos = open_tag_m.end()
+
+    return results
+
+
+def _extract_content_to_close_tag(
+    html: str,
+    start: int,
+    close_re: re.Pattern,
+    close_table_re: re.Pattern,
+) -> str | None:
+    """Return content from `start` to the first `close_re` match, skipping nested <table> blocks."""
+    pos = start
+    open_table_re = re.compile(r"<table\b", re.IGNORECASE)
+
+    while pos < len(html):
+        open_table_m = open_table_re.search(html, pos)
+        close_m = close_re.search(html, pos)
+
+        if close_m is None:
+            return None
+
+        if open_table_m is None or close_m.start() <= open_table_m.start():
+            return html[start : close_m.start()]
+
+        # Nested table precedes the close tag; skip it.
+        nested_content = _extract_balanced_tag_content(html, "table", open_table_m.end())
+        if nested_content is None:
+            return None
+        skip_end = open_table_m.end() + len(nested_content)
+        close_table_m = close_table_re.search(html, skip_end)
+        pos = close_table_m.end() if close_table_m else skip_end
+
+    return None
 
 
 def _extract_anchor_text(cell_html: str) -> str | None:
@@ -539,11 +724,6 @@ def _parse_title_author_from_multiline_text(text: str) -> tuple[str, str | None]
             break
 
     return title, author
-
-
-def _is_hold_ready(status_text: str) -> bool:
-    lowered = status_text.lower()
-    return any(marker in lowered for marker in ["ready", "available", "pickup", "download"])
 
 
 def _is_hold_ready(text: str) -> bool:
