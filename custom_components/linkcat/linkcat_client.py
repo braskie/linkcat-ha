@@ -64,7 +64,8 @@ class LinkcatClient:
             headers={"Referer": self._base_url},
         )
 
-        if _contains_auth_failure(login_html):
+        if _contains_explicit_auth_failure(login_html):
+            _LOGGER.debug("Linkcat login POST returned explicit auth failure text")
             raise LinkcatAuthError("Linkcat login failed. Check username/password.")
 
         account_html = await _request_text(
@@ -75,6 +76,7 @@ class LinkcatClient:
         )
 
         if _looks_logged_out(account_html):
+            _LOGGER.debug("Linkcat account page still contains login form fields after submit")
             raise LinkcatAuthError("Linkcat login failed. Check username/password.")
 
         return account_html
@@ -177,7 +179,7 @@ def _extract_attr(tag_html: str, attr_name: str) -> str | None:
     return html.unescape(match.group(1)).strip()
 
 
-def _contains_auth_failure(html_text: str) -> bool:
+def _contains_explicit_auth_failure(html_text: str) -> bool:
     lowered = _html_to_text(html_text).lower()
     failure_markers = [
         "invalid login",
@@ -186,15 +188,20 @@ def _contains_auth_failure(html_text: str) -> bool:
         "unsuccessful",
         "authentication failed",
         "login failed",
-        "login/barcode",
-        "password/pin",
+        "unable to authenticate",
     ]
     return any(marker in lowered for marker in failure_markers)
 
 
 def _looks_logged_out(account_html: str) -> bool:
     lowered = account_html.lower()
-    return "name=\"j_username\"" in lowered or "id=\"j_username\"" in lowered
+    return (
+        "id=\"loginpageform\"" in lowered
+        or "name=\"j_username\"" in lowered
+        or "id=\"j_username\"" in lowered
+        or "name=\"j_password\"" in lowered
+        or "id=\"j_password\"" in lowered
+    )
 
 
 def _html_to_text(fragment: str) -> str:
