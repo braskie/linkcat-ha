@@ -3,9 +3,9 @@
     "step": {
       "user": {
         "title": "Connect to Linkcat",
-        "description": "Enter your Linkcat login credentials.",
+        "description": "Enter your library card barcode and password/PIN.",
         "data": {
-          "username": "Login",
+          "username": "Library card / barcode",
           "password": "Password"
         }
       }

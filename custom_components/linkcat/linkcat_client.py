@@ -116,10 +116,15 @@ class LinkcatClient:
             "try again",
             "authentication failed",
             "login failed",
-            "password/pin",
         ]
 
         login_dialog = page.get_by_role("dialog", name=re.compile(r"log in", re.IGNORECASE))
+        try:
+            if await page.locator("text=My Account").count() > 0 or await page.locator("text=Checkouts").count() > 0:
+                return False
+        except Exception:
+            _LOGGER.debug("Failed checking account hints", exc_info=True)
+
         visible_text = ""
         try:
             if await login_dialog.count() > 0:
@@ -127,14 +132,16 @@ class LinkcatClient:
         except Exception:
             _LOGGER.debug("Failed reading login dialog text", exc_info=True)
 
-        page_text = ""
-        try:
-            page_text = (await page.locator("body").inner_text()).lower()
-        except Exception:
-            _LOGGER.debug("Failed reading page text", exc_info=True)
+        if any(marker in visible_text for marker in failure_markers):
+            return True
 
-        combined_text = f"{visible_text} {page_text}"
-        return any(marker in combined_text for marker in failure_markers)
+        try:
+            if await login_dialog.count() > 0 and await login_dialog.first.is_visible():
+                return True
+        except Exception:
+            _LOGGER.debug("Failed checking login dialog visibility", exc_info=True)
+
+        return False
 
     async def _scrape_account(self, page: Page) -> LinkcatAccountData:
         account_selectors = [
