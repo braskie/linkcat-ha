@@ -44,8 +44,10 @@ class LinkcatClient:
             await self._login_and_get_account_page(session)
 
     async def _login_and_get_account_page(self, session: aiohttp.ClientSession) -> str:
-        home_html = await _request_text(session, "GET", self._base_url)
-        login_form = _extract_login_form(home_html)
+        # The Linkcat home page renders login mostly through JS; the account URL returns
+        # a server-rendered login form that can be parsed without browser automation.
+        login_page_html = await _request_text(session, "GET", self._account_url)
+        login_form = _extract_login_form(login_page_html)
         if login_form is None:
             raise LinkcatConnectionError("Could not find Linkcat login form.")
 
@@ -61,7 +63,7 @@ class LinkcatClient:
             "POST",
             login_url,
             data=payload,
-            headers={"Referer": self._base_url},
+            headers={"Referer": self._account_url},
         )
 
         if _contains_explicit_auth_failure(login_html):
@@ -195,12 +197,30 @@ def _contains_explicit_auth_failure(html_text: str) -> bool:
 
 def _looks_logged_out(account_html: str) -> bool:
     lowered = account_html.lower()
+    has_account_indicators = any(
+        marker in lowered
+        for marker in (
+            "librarycheckoutstable",
+            "holdstab",
+            "items checked out",
+            "items on hold",
+            "ready for pickup",
+            "my account",
+        )
+    )
+
+    if has_account_indicators:
+        return False
+
+    # Login-page specific markers are more reliable than generic j_username fields,
+    # which may appear in unrelated forms on authenticated pages.
     return (
         "id=\"loginpageform\"" in lowered
-        or "name=\"j_username\"" in lowered
-        or "id=\"j_username\"" in lowered
-        or "name=\"j_password\"" in lowered
-        or "id=\"j_password\"" in lowered
+        or "patronloginform.loginpageform" in lowered
+        or (
+            ("name=\"j_username\"" in lowered or "id=\"j_username\"" in lowered)
+            and ("name=\"j_password\"" in lowered or "id=\"j_password\"" in lowered)
+        )
     )
 
 
