@@ -22,6 +22,10 @@ class LinkcatAuthError(Exception):
     """Raised when Linkcat authentication fails."""
 
 
+class LinkcatDependencyError(Exception):
+    """Raised when required runtime dependencies are unavailable."""
+
+
 class LinkcatClient:
     """Client used to scrape account data from Linkcat."""
 
@@ -119,11 +123,9 @@ class LinkcatClient:
         ]
 
         login_dialog = page.get_by_role("dialog", name=re.compile(r"log in", re.IGNORECASE))
-        try:
-            if await page.locator("text=My Account").count() > 0 or await page.locator("text=Checkouts").count() > 0:
-                return False
-        except Exception:
-            _LOGGER.debug("Failed checking account hints", exc_info=True)
+
+        if re.search(r"/search/account", str(page.url), re.IGNORECASE):
+            return False
 
         visible_text = ""
         try:
@@ -217,7 +219,7 @@ def _import_playwright_async_api() -> Any:
     try:
         return importlib.import_module("playwright.async_api")
     except ImportError as exc:
-        raise LinkcatAuthError(
+        raise LinkcatDependencyError(
             "Playwright is not installed. Install integration requirements and browser dependencies."
         ) from exc
 

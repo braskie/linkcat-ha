@@ -16,7 +16,7 @@ from .const import (
     MAX_SCAN_INTERVAL_HOURS,
     MIN_SCAN_INTERVAL_HOURS,
 )
-from .linkcat_client import LinkcatAuthError, LinkcatClient
+from .linkcat_client import LinkcatAuthError, LinkcatClient, LinkcatDependencyError
 
 
 class LinkcatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -43,6 +43,8 @@ class LinkcatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 await client.validate_credentials()
+            except LinkcatDependencyError:
+                errors["base"] = "missing_dependency"
             except LinkcatAuthError:
                 errors["base"] = "invalid_auth"
             except Exception:
