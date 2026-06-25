@@ -72,24 +72,14 @@ class LinkcatClient:
                 await page.locator(selector).first.click()
                 break
 
-        username_selectors = [
-            "input[name='j_username']:visible",
-            "#j_username:visible",
-            "input[name='username']",
-            "input[name='user']",
-            "input[id*='username']",
-            "input[type='text']",
-        ]
-        password_selectors = [
-            "input[name='j_password']:visible",
-            "#j_password:visible",
-            "input[name='password']",
-            "input[id*='password']",
-            "input[type='password']",
-        ]
+        login_dialog = page.get_by_role("dialog", name=re.compile(r"log in", re.IGNORECASE))
+        try:
+            await login_dialog.wait_for(state="visible", timeout=10000)
+        except Exception:
+            pass
 
-        username_locator = await _first_existing_locator(page, username_selectors)
-        password_locator = await _first_existing_locator(page, password_selectors)
+        username_locator = login_dialog.locator("#j_username, input[name='j_username']").first
+        password_locator = login_dialog.locator("#j_password, input[name='j_password']").first
 
         if username_locator is None or password_locator is None:
             raise LinkcatAuthError("Could not find login form fields on Linkcat page.")
@@ -97,26 +87,16 @@ class LinkcatClient:
         await username_locator.fill(self._username)
         await password_locator.fill(self._password)
 
-        submit_selectors = [
-            "#submit_0",
-            "input[name='submit_0']",
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Log In')",
-            "button:has-text('Login')",
-        ]
-        submitted = False
-        for selector in submit_selectors:
-            locator = page.locator(selector)
-            if await locator.count() > 0:
-                await locator.first.click()
-                submitted = True
-                break
-
-        if not submitted:
+        submit_locator = login_dialog.locator("#submit_0, input[name='submit_0'], button[type='submit'], input[type='submit']").first
+        if await submit_locator.count() > 0:
+            await submit_locator.click()
+        else:
             await password_locator.press("Enter")
 
-        await page.wait_for_timeout(2500)
+        try:
+            await page.wait_for_url(re.compile(r"/search/account\??$"), timeout=15000)
+        except Exception:
+            await page.wait_for_timeout(2500)
 
         if await page.locator("button:has-text('Close')").count() > 0:
             try:
@@ -129,24 +109,32 @@ class LinkcatClient:
 
     async def _is_auth_failed(self, page: Page) -> bool:
         failure_markers = [
-            "invalid",
+            "invalid login",
+            "invalid password",
             "incorrect",
             "unsuccessful",
             "try again",
             "authentication failed",
+            "login failed",
+            "password/pin",
         ]
 
-        content = (await page.content()).lower()
-        if any(marker in content for marker in failure_markers):
-            return True
+        login_dialog = page.get_by_role("dialog", name=re.compile(r"log in", re.IGNORECASE))
+        visible_text = ""
+        try:
+            if await login_dialog.count() > 0:
+                visible_text = (await login_dialog.first.inner_text()).lower()
+        except Exception:
+            _LOGGER.debug("Failed reading login dialog text", exc_info=True)
 
-        has_password_field = await page.locator("input[type='password']").count() > 0
-        has_account_hint = any(
-            await page.locator(selector).count() > 0
-            for selector in ["text=Checkouts", "text=Holds", "a[href*='account']", "text=My Account"]
-        )
+        page_text = ""
+        try:
+            page_text = (await page.locator("body").inner_text()).lower()
+        except Exception:
+            _LOGGER.debug("Failed reading page text", exc_info=True)
 
-        return has_password_field and not has_account_hint
+        combined_text = f"{visible_text} {page_text}"
+        return any(marker in combined_text for marker in failure_markers)
 
     async def _scrape_account(self, page: Page) -> LinkcatAccountData:
         account_selectors = [
