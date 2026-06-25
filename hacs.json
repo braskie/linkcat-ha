@@ -1,0 +1,8 @@
+{
+  "name": "Linkcat Library",
+  "content_in_root": false,
+  "country": "US",
+  "homeassistant": "2024.6.0",
+  "render_readme": true,
+  "domains": ["sensor"]
+}

@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Linkcat",
+        "description": "Enter your Linkcat login credentials.",
+        "data": {
+          "username": "Login",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid login or password",
+      "cannot_connect": "Failed to connect to Linkcat"
+    },
+    "abort": {
+      "already_configured": "This Linkcat account is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Linkcat Options",
+        "description": "Configure Linkcat polling behavior. Recommended: 12-24 hours to reduce scraping frequency.",
+        "data": {
+          "scan_interval_hours": "Poll interval (hours)"
+        }
+      }
+    }
+  }
+}
