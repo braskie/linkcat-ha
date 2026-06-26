@@ -321,6 +321,15 @@ def _html_to_text(fragment: str) -> str:
     return text.strip()
 
 
+_SORT_HEADER_TEXT = "click to sort"
+_TITLE_AUTHOR_HEADER_TEXT = "title/author"
+
+
+def _is_header_row(row_html: str) -> bool:
+    """Return True when the row contains no <td> cells (i.e., it is a header/th-only row)."""
+    return not bool(re.search(r"<td\b", row_html, re.IGNORECASE))
+
+
 def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutItem]:
     table_html = _find_table(
         account_html,
@@ -383,21 +392,72 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
         if len(cells) < 2:
             continue
 
-        title, author = _parse_title_author_from_multiline_text(_html_to_text(cells[1]))
-        if not title:
-            title = _html_to_text(cells[1])
+        row_text = _html_to_text(row_html)
+        if _SORT_HEADER_TEXT in row_text.lower() or _is_header_row(row_html):
+            continue
 
-        status = _html_to_text(cells[2]) if len(cells) > 2 else _html_to_text(row_html)
-        ready = _is_hold_ready(status)
+        title = None
+        author = None
+        title_cell_idx = None
+        for idx, cell in enumerate(cells):
+            anchor = _extract_anchor_text(cell)
+            if anchor and _TITLE_AUTHOR_HEADER_TEXT not in anchor.lower():
+                title = anchor
+                title_cell_idx = idx
+                break
+
+        # Fallback: multiline parse across cells
+        if not title:
+            for idx, cell in enumerate(cells):
+                t, a = _parse_title_author_from_multiline_text(_html_to_text(cell))
+                if t and _TITLE_AUTHOR_HEADER_TEXT not in t.lower():
+                    title, author = t, a
+                    title_cell_idx = idx
+                    break
+
+        # Extract author from the same cell as the title
+        if title and title_cell_idx is not None and author is None:
+            _, author = _parse_title_author_from_multiline_text(_html_to_text(cells[title_cell_idx]))
+
+        # Status is the next cell after the title, with cells[2] as a fallback
+        status = None
+        if title_cell_idx is not None and title_cell_idx + 1 < len(cells):
+            status = _html_to_text(cells[title_cell_idx + 1]).strip() or None
+        if not status and len(cells) > 2:
+            status = _html_to_text(cells[2]).strip() or None
+
+        ready = _is_hold_ready(status or row_text)
         image_url = _extract_image_url(row_html, base_url)
 
-        if title and "title/author" not in title.lower():
+        if title and _TITLE_AUTHOR_HEADER_TEXT not in title.lower():
             holds.append(HoldItem(title=title, author=author, image_url=image_url, status=status, ready=ready))
 
     if not holds:
         holds = _extract_hold_links_fallback(account_html)
 
     return _dedupe_holds(holds)
+
+
+def _extract_balanced_tag_content(html: str, tag: str, content_start: int) -> str | None:
+    """Return the content from content_start up to the matching closing tag, handling nesting."""
+    depth = 1
+    pos = content_start
+    open_re = re.compile(rf"<{re.escape(tag)}\b", re.IGNORECASE)
+    close_re = re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE)
+    while depth > 0:
+        open_m = open_re.search(html, pos)
+        close_m = close_re.search(html, pos)
+        if close_m is None:
+            return None
+        if open_m is not None and open_m.start() < close_m.start():
+            depth += 1
+            pos = open_m.end()
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[content_start : close_m.start()]
+            pos = close_m.end()
+    return None
 
 
 def _find_table(account_html: str, id_hints: list[str]) -> str | None:
@@ -428,11 +488,17 @@ def _find_table(account_html: str, id_hints: list[str]) -> str | None:
             normalized_html,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        if section_match:
-            table_match = re.search(r"<table[^>]*>(.*?)</table>", section_match.group(1), flags=re.IGNORECASE | re.DOTALL)
-            if table_match:
-                return table_match.group(1)
+        if open_m:
+            div_content = _extract_balanced_tag_content(account_html, "div", open_m.end())
+            if div_content:
+                table_open_m = re.search(r"<table\b[^>]*>", div_content, flags=re.IGNORECASE)
+                if table_open_m:
+                    content = _extract_balanced_tag_content(div_content, "table", table_open_m.end())
+                    if content is not None:
+                        _LOGGER.debug("Found table via div id hint '%s'", id_hint)
+                        return content
 
+    _LOGGER.debug("No table found for id hints: %s", id_hints)
     return None
 
 
