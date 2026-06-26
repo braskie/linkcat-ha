@@ -349,18 +349,42 @@ def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutIte
                 continue
 
             row_text = _html_to_text(row_html)
-            if "click to sort" in row_text.lower():
+            lower_row = row_text.lower()
+            if (
+                _SORT_HEADER_TEXT in lower_row
+                or _is_header_row(row_html)
+                or "checkoutsheader" in row_html.lower()
+                or _TITLE_AUTHOR_HEADER_TEXT in lower_row
+            ):
                 continue
 
-            title = _extract_anchor_text(cells[0]) or _extract_anchor_text(cells[1])
+            title = None
             author = None
-            if len(cells) > 2:
-                parsed_title, parsed_author = _parse_title_author_from_multiline_text(_html_to_text(cells[2]))
-                title = title or parsed_title
-                author = parsed_author
+            title_cell_idx = None
+
+            for idx, cell in enumerate(cells):
+                anchor = _extract_anchor_text(cell)
+                if anchor and _TITLE_AUTHOR_HEADER_TEXT not in anchor.lower():
+                    title = anchor
+                    title_cell_idx = idx
+                    break
+
+            if not title:
+                for idx, cell in enumerate(cells):
+                    parsed_title, parsed_author = _parse_title_author_from_multiline_text(_html_to_text(cell))
+                    if parsed_title and _TITLE_AUTHOR_HEADER_TEXT not in parsed_title.lower():
+                        title = parsed_title
+                        author = parsed_author
+                        title_cell_idx = idx
+                        break
+
+            if title and title_cell_idx is not None and author is None:
+                _, author = _parse_title_author_from_multiline_text(_html_to_text(cells[title_cell_idx]))
 
             if not title:
                 title = row_text.split("Shelf Number:", maxsplit=1)[0].strip()
+            if not title or _TITLE_AUTHOR_HEADER_TEXT in title.lower():
+                continue
 
             image_url = _extract_image_url(row_html, base_url)
             due_date = _extract_due_date(_html_to_text(cells[-1])) or _extract_due_date(row_text)
@@ -488,8 +512,8 @@ def _find_table(account_html: str, id_hints: list[str]) -> str | None:
             normalized_html,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        if open_m:
-            div_content = _extract_balanced_tag_content(account_html, "div", open_m.end())
+        if section_match:
+            div_content = _extract_balanced_tag_content(normalized_html, "div", section_match.end())
             if div_content:
                 table_open_m = re.search(r"<table\b[^>]*>", div_content, flags=re.IGNORECASE)
                 if table_open_m:
