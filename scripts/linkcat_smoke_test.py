@@ -47,10 +47,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="After credential validation, fetch and print checkout/hold counts",
     )
+    parser.add_argument(
+        "--dump-html-dir",
+        type=str,
+        default="",
+        help="Optional directory where raw Linkcat HTML pages should be saved",
+    )
     return parser.parse_args()
 
 
-async def _run(fetch: bool) -> int:
+async def _run(fetch: bool, dump_html_dir: str) -> int:
     username = os.getenv("LINKCAT_USERNAME", "").strip()
     password = os.getenv("LINKCAT_PASSWORD", "").strip()
 
@@ -58,6 +64,10 @@ async def _run(fetch: bool) -> int:
         print("RESULT=MISSING_ENV")
         print("Set LINKCAT_USERNAME and LINKCAT_PASSWORD before running.")
         return 2
+
+    if dump_html_dir:
+        os.environ["LINKCAT_DEBUG_HTML_DIR"] = dump_html_dir
+        print(f"HTML_DUMP_DIR={dump_html_dir}")
 
     _prepare_import_path()
     module = importlib.import_module("custom_components.linkcat.linkcat_client")
@@ -96,7 +106,7 @@ async def _run(fetch: bool) -> int:
 
 def main() -> int:
     args = _parse_args()
-    return asyncio.run(_run(fetch=args.fetch))
+    return asyncio.run(_run(fetch=args.fetch, dump_html_dir=args.dump_html_dir))
 
 
 if __name__ == "__main__":

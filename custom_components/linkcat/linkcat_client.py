@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
+import os
 import re
 from typing import Any
 from urllib.parse import urljoin
@@ -14,6 +16,7 @@ from .const import BASE_URL
 from .models import CheckoutItem, HoldItem, LinkcatAccountData
 
 _LOGGER = logging.getLogger(__name__)
+
 
 class LinkcatAuthError(Exception):
     """Raised when Linkcat authentication fails."""
@@ -36,7 +39,8 @@ class LinkcatClient:
         """Log in and scrape checkouts and holds from Linkcat."""
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
             account_html = await self._login_and_get_account_page(session)
-            return self._parse_account_data(account_html)
+            subpages = await self._fetch_account_subpages(session, account_html)
+            return self._parse_account_data([account_html, *subpages])
 
     async def validate_credentials(self) -> None:
         """Validate credentials by attempting login."""
@@ -44,9 +48,11 @@ class LinkcatClient:
             await self._login_and_get_account_page(session)
 
     async def _login_and_get_account_page(self, session: aiohttp.ClientSession) -> str:
-        # The Linkcat home page renders login mostly through JS; the account URL returns
-        # a server-rendered login form that can be parsed without browser automation.
+        # The account URL returns a server-rendered login form that can be parsed
+        # without browser automation.
         login_page_html = await _request_text(session, "GET", self._account_url)
+        _debug_dump_html("login_page", login_page_html)
+
         login_form = _extract_login_form(login_page_html)
         if login_form is None:
             raise LinkcatConnectionError("Could not find Linkcat login form.")
@@ -57,14 +63,22 @@ class LinkcatClient:
         if "submit_0" in payload and not payload["submit_0"]:
             payload["submit_0"] = "Log In"
 
+        csrf_token = payload.get("sdcsrf", "")
+
         login_url = urljoin(self._base_url, str(login_form["action"]))
         login_html = await _request_text(
             session,
             "POST",
             login_url,
             data=payload,
-            headers={"Referer": self._account_url},
+            headers={
+                "Referer": self._account_url,
+                "sdcsrf": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "text/html, */*; q=0.01",
+            },
         )
+        _debug_dump_html("post_login", login_html)
 
         if _contains_explicit_auth_failure(login_html):
             _LOGGER.debug("Linkcat login POST returned explicit auth failure text")
@@ -76,6 +90,7 @@ class LinkcatClient:
             self._account_url,
             headers={"Referer": login_url},
         )
+        _debug_dump_html("account", account_html)
 
         if _looks_logged_out(account_html):
             _LOGGER.debug("Linkcat account page still contains login form fields after submit")
@@ -83,11 +98,84 @@ class LinkcatClient:
 
         return account_html
 
-    def _parse_account_data(self, account_html: str) -> LinkcatAccountData:
-        body_text = _html_to_text(account_html)
+    async def _fetch_account_subpages(self, session: aiohttp.ClientSession, account_html: str) -> list[str]:
+        candidate_urls: list[str] = [
+            urljoin(self._base_url, "search/account/checkouts?"),
+            urljoin(self._base_url, "search/account/holds?"),
+            urljoin(self._base_url, "search/account/dashboard?"),
+        ]
 
-        checkouts = _extract_checkout_rows(account_html, self._base_url)
-        holds = _extract_hold_rows(account_html, self._base_url)
+        progressive_urls = _extract_progressive_display_urls(account_html)
+        for progressive_url in progressive_urls:
+            candidate_urls.append(urljoin(self._base_url, progressive_url))
+
+        for href in _extract_account_links(account_html):
+            candidate_urls.append(urljoin(self._base_url, href))
+
+        seen: set[str] = set()
+        pages: list[str] = []
+        for url in candidate_urls:
+            if url in seen:
+                continue
+            seen.add(url)
+
+            is_progressive = any(token in url.lower() for token in ("account.accountnonmobile.", "librarycheckoutsaccordion", "libraryholdsaccordion"))
+
+            csrf_token = _extract_sdcsrf_from_url(url) or _extract_sdcsrf_from_html(account_html)
+            request_url = _strip_sdcsrf_from_url(url) if is_progressive else url
+            headers = {
+                "Referer": self._account_url,
+                "Accept": "text/html, */*; q=0.01",
+            }
+            if is_progressive:
+                headers.update(
+                    {
+                        "X-Requested-With": "XMLHttpRequest",
+                        "X-Prototype-Version": "1.7",
+                    }
+                )
+                if csrf_token:
+                    headers["sdcsrf"] = csrf_token
+
+            try:
+                page_html = await _request_text(
+                    session,
+                    "GET",
+                    request_url,
+                    headers=headers,
+                )
+            except LinkcatConnectionError:
+                continue
+
+            if _looks_logged_out(page_html):
+                continue
+
+            if _is_system_error_page(page_html):
+                _debug_dump_html(f"{_safe_page_name_from_url(request_url)}_system_error", page_html)
+                continue
+
+            pages.append(page_html)
+            _debug_dump_html(_safe_page_name_from_url(request_url), page_html)
+
+        return pages
+
+    def _parse_account_data(self, pages: list[str]) -> LinkcatAccountData:
+        page_fragments: list[str] = []
+        for page_html in pages:
+            page_fragments.extend(_extract_html_fragments(page_html))
+
+        body_text = "\n".join(_html_to_text(fragment) for fragment in page_fragments)
+
+        checkouts: list[CheckoutItem] = []
+        holds: list[HoldItem] = []
+
+        for page_html in page_fragments:
+            if not checkouts:
+                checkouts = _extract_checkout_rows(page_html, self._base_url)
+            if not holds:
+                holds = _extract_hold_rows(page_html, self._base_url)
+            if checkouts and holds:
+                break
 
         checkout_count = _extract_count(body_text, ["checkouts", "checked out", "items out"])
         hold_count = _extract_count(body_text, ["holds", "on hold"])
@@ -212,8 +300,6 @@ def _looks_logged_out(account_html: str) -> bool:
     if has_account_indicators:
         return False
 
-    # Login-page specific markers are more reliable than generic j_username fields,
-    # which may appear in unrelated forms on authenticated pages.
     return (
         "id=\"loginpageform\"" in lowered
         or "patronloginform.loginpageform" in lowered
@@ -236,43 +322,60 @@ def _html_to_text(fragment: str) -> str:
 
 
 def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutItem]:
-    table_html = _find_table(account_html, ["libraryCheckoutsTable", "checkoutsTab"])
-    if not table_html:
-        return []
+    table_html = _find_table(
+        account_html,
+        [
+            "libraryCheckoutsTable",
+            "checkoutsTab",
+            "myCheckouts_checkoutslistnonmobile_table",
+            "checkoutslistnonmobile_table",
+        ],
+    )
 
     checkouts: list[CheckoutItem] = []
-    for row_html in _extract_table_rows(table_html):
-        cells = _extract_cells(row_html)
-        if len(cells) < 2:
-            continue
+    if table_html:
+        for row_html in _extract_table_rows(table_html):
+            cells = _extract_cells(row_html)
+            if len(cells) < 2:
+                continue
 
-        row_text = _html_to_text(row_html)
-        if "click to sort" in row_text.lower():
-            continue
+            row_text = _html_to_text(row_html)
+            if "click to sort" in row_text.lower():
+                continue
 
-        title = _extract_anchor_text(cells[0]) or _extract_anchor_text(cells[1])
-        author = None
-        if len(cells) > 2:
-            parsed_title, parsed_author = _parse_title_author_from_multiline_text(_html_to_text(cells[2]))
-            title = title or parsed_title
-            author = parsed_author
+            title = _extract_anchor_text(cells[0]) or _extract_anchor_text(cells[1])
+            author = None
+            if len(cells) > 2:
+                parsed_title, parsed_author = _parse_title_author_from_multiline_text(_html_to_text(cells[2]))
+                title = title or parsed_title
+                author = parsed_author
 
-        if not title:
-            title = row_text.split("Shelf Number:", maxsplit=1)[0].strip()
+            if not title:
+                title = row_text.split("Shelf Number:", maxsplit=1)[0].strip()
 
-        image_url = _extract_image_url(row_html, base_url)
-        due_date = _extract_due_date(_html_to_text(cells[-1])) or _extract_due_date(row_text)
+            image_url = _extract_image_url(row_html, base_url)
+            due_date = _extract_due_date(_html_to_text(cells[-1])) or _extract_due_date(row_text)
 
-        if title:
-            checkouts.append(CheckoutItem(title=title, author=author, image_url=image_url, due_date=due_date))
+            if title:
+                checkouts.append(CheckoutItem(title=title, author=author, image_url=image_url, due_date=due_date))
+
+    if not checkouts:
+        checkouts = _extract_checkout_links_fallback(account_html)
 
     return _dedupe_checkouts(checkouts)
 
 
 def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
-    table_html = _find_table(account_html, ["holdsTab"])
+    table_html = _find_table(
+        account_html,
+        [
+            "holdsTab",
+            "myHolds_holdslistnonmobile_table",
+            "holdslistnonmobile_table",
+        ],
+    )
     if not table_html:
-        return []
+        return _extract_hold_links_fallback(account_html)
 
     holds: list[HoldItem] = []
     for row_html in _extract_table_rows(table_html):
@@ -291,24 +394,38 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
         if title and "title/author" not in title.lower():
             holds.append(HoldItem(title=title, author=author, image_url=image_url, status=status, ready=ready))
 
+    if not holds:
+        holds = _extract_hold_links_fallback(account_html)
+
     return _dedupe_holds(holds)
 
 
 def _find_table(account_html: str, id_hints: list[str]) -> str | None:
+    normalized_html = _normalize_html_fragment(account_html)
+
     for id_hint in id_hints:
         match = re.search(
             rf"<table[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>(.*?)</table>",
-            account_html,
+            normalized_html,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if match:
             return match.group(1)
 
-    # Fallback: search for any table within a section div matching id hints.
+    class_hints = ["checkoutslist", "holdslist", "detailitemtable"]
+    for class_hint in class_hints:
+        match = re.search(
+            rf"<table[^>]*class=['\"][^'\"]*{class_hint}[^'\"]*['\"][^>]*>(.*?)</table>",
+            normalized_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1)
+
     for id_hint in id_hints:
         section_match = re.search(
             rf"<div[^>]*id=['\"][^'\"]*{re.escape(id_hint)}[^'\"]*['\"][^>]*>(.*?)</div>",
-            account_html,
+            normalized_html,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if section_match:
@@ -320,14 +437,17 @@ def _find_table(account_html: str, id_hints: list[str]) -> str | None:
 
 
 def _extract_table_rows(table_html: str) -> list[str]:
-    return re.findall(r"<tr\b[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL)
+    normalized_table = _normalize_html_fragment(table_html)
+    return re.findall(r"<tr\b[^>]*>(.*?)</tr>", normalized_table, flags=re.IGNORECASE | re.DOTALL)
 
 
 def _extract_cells(row_html: str) -> list[str]:
-    return re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
+    normalized_row = _normalize_html_fragment(row_html)
+    return re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", normalized_row, flags=re.IGNORECASE | re.DOTALL)
 
 
 def _extract_anchor_text(cell_html: str) -> str | None:
+    cell_html = _normalize_html_fragment(cell_html)
     anchor_match = re.search(r"<a\b[^>]*>(.*?)</a>", cell_html, flags=re.IGNORECASE | re.DOTALL)
     if not anchor_match:
         return None
@@ -336,6 +456,16 @@ def _extract_anchor_text(cell_html: str) -> str | None:
 
 
 def _extract_image_url(fragment_html: str, base_url: str) -> str | None:
+    fragment_html = _normalize_html_fragment(fragment_html)
+
+    cover_match = re.search(
+        r"<img\b[^>]*(?:class=['\"][^'\"]*accountCoverImage[^'\"]*['\"]|id=['\"][^'\"]*(?:checkoutsImage|holdsImage)[^'\"]*['\"])[^>]*\bsrc=['\"]([^'\"]+)['\"]",
+        fragment_html,
+        flags=re.IGNORECASE,
+    )
+    if cover_match:
+        return urljoin(base_url, html.unescape(cover_match.group(1)).strip())
+
     image_match = re.search(r"<img\b[^>]*\bsrc=['\"]([^'\"]+)['\"]", fragment_html, flags=re.IGNORECASE)
     if not image_match:
         return None
@@ -346,6 +476,7 @@ def _extract_due_date(text: str) -> str | None:
     date_patterns = [
         r"due\s*(\d{1,2}/\d{1,2}/\d{2,4})",
         r"due\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b",
     ]
     for pattern in date_patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -354,149 +485,30 @@ def _extract_due_date(text: str) -> str | None:
     return None
 
 
-async def _extract_linkcat_summary_value(page: Page, strategies: list[tuple[str, str | None]]) -> int | None:
-    for section_name, label in strategies:
-        section = page.locator(f"div:has(> a:has-text('{section_name}'), > span:has-text('{section_name}'))").first
-        if await section.count() > 0:
-            section_text = " ".join((await section.inner_text()).split())
-
-            if label is None:
-                value = _extract_count(section_text, [section_name])
-                if value is not None:
-                    return value
-            else:
-                value = _extract_count(section_text, [label])
-                if value is not None:
-                    return value
-
-    headings = page.locator("h1, h2, h3, h4")
-    heading_count = min(await headings.count(), 60)
-    for idx in range(heading_count):
-        text = " ".join((await headings.nth(idx).inner_text()).split())
-        for section_name, label in strategies:
-            if section_name.lower() not in text.lower():
-                continue
-
-            if label is None:
-                value = _extract_count(text, [section_name])
-                if value is not None:
-                    return value
-            else:
-                value = _extract_count(text, [label])
-                if value is not None:
-                    return value
-
-    return None
+def _extract_checkout_links_fallback(account_html: str) -> list[CheckoutItem]:
+    items: list[CheckoutItem] = []
+    for title_html in re.findall(
+        r"<a[^>]*href=['\"][^'\"]*detailnonmodal[^'\"]*['\"][^>]*>(.*?)</a>",
+        account_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        title = _html_to_text(title_html)
+        if title and "click to sort" not in title.lower():
+            items.append(CheckoutItem(title=title))
+    return items
 
 
-async def _extract_linkcat_checkout_rows(page: Page) -> list[CheckoutItem]:
-    selectors = [
-        "#libraryCheckoutsTable tbody tr",
-        "#checkoutsTab table tbody tr",
-    ]
-    rows: list[CheckoutItem] = []
-
-    for selector in selectors:
-        locator = page.locator(selector)
-        count = min(await locator.count(), 100)
-        if count == 0:
-            continue
-
-        for idx in range(count):
-            row = locator.nth(idx)
-            row_text = " ".join((await row.inner_text()).split())
-            if not row_text:
-                continue
-
-            title_locator = row.locator("a[href*='detailnonmodal']").first
-            title = ""
-            author = None
-            if await title_locator.count() > 0:
-                title = (await title_locator.inner_text()).strip()
-
-            image_url = await _extract_row_image_url(page, row)
-
-            cells = row.locator("td")
-            cell_count = await cells.count()
-            due_date = None
-            if cell_count > 0:
-                due_date = _extract_due_date(" ".join((await cells.nth(cell_count - 1).inner_text()).split()))
-
-            if cell_count > 2:
-                title_author_text = await cells.nth(2).inner_text()
-                parsed_title, parsed_author = _parse_title_author_from_multiline_text(title_author_text)
-                if not title:
-                    title = parsed_title
-                author = parsed_author or author
-
-            if not title:
-                title = row_text.split("Shelf Number:", maxsplit=1)[0].strip()
-
-            if title and "click to sort" not in title.lower():
-                rows.append(
-                    CheckoutItem(
-                        title=title,
-                        author=author,
-                        image_url=image_url,
-                        due_date=due_date or _extract_due_date(row_text),
-                    )
-                )
-
-        if rows:
-            return rows
-
-    return rows
-
-
-async def _extract_linkcat_hold_rows(page: Page) -> list[HoldItem]:
-    selectors = [
-        "#holdsTab table tbody tr",
-        "#holdsTab table tr",
-    ]
-    rows: list[HoldItem] = []
-
-    for selector in selectors:
-        locator = page.locator(selector)
-        count = min(await locator.count(), 100)
-        if count == 0:
-            continue
-
-        for idx in range(count):
-            row = locator.nth(idx)
-            cells = row.locator("td")
-            cell_count = await cells.count()
-            if cell_count < 2:
-                continue
-
-            title_author_text = await cells.nth(1).inner_text()
-            title, author = _parse_title_author_from_multiline_text(title_author_text)
-            if not title:
-                title = " ".join(title_author_text.split())
-
-            image_url = await _extract_row_image_url(page, row)
-
-            status = ""
-            if cell_count > 2:
-                status = " ".join((await cells.nth(2).inner_text()).split())
-
-            row_text = " ".join((await row.inner_text()).split())
-            ready = _is_hold_ready(status or row_text)
-
-            if title and "title/author" not in title.lower():
-                rows.append(
-                    HoldItem(
-                        title=title,
-                        author=author,
-                        image_url=image_url,
-                        status=status or row_text,
-                        ready=ready,
-                    )
-                )
-
-        if rows:
-            return rows
-
-    return rows
+def _extract_hold_links_fallback(account_html: str) -> list[HoldItem]:
+    items: list[HoldItem] = []
+    for title_html in re.findall(
+        r"<a[^>]*href=['\"][^'\"]*detailnonmodal[^'\"]*['\"][^>]*>(.*?)</a>",
+        account_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        title = _html_to_text(title_html)
+        if title and "click to sort" not in title.lower():
+            items.append(HoldItem(title=title))
+    return items
 
 
 def _dedupe_checkouts(items: list[CheckoutItem]) -> list[CheckoutItem]:
@@ -541,13 +553,123 @@ def _parse_title_author_from_multiline_text(text: str) -> tuple[str, str | None]
     return title, author
 
 
-def _is_hold_ready(status_text: str) -> bool:
-    lowered = status_text.lower()
-    return any(marker in lowered for marker in ["ready", "available", "pickup", "download"])
-
-
 def _is_hold_ready(text: str) -> bool:
     lowered = text.lower()
     if any(blocker in lowered for blocker in ("pending", "in process", "queued", "in transit")):
         return False
     return any(keyword in lowered for keyword in ("ready", "pickup", "available", "download available"))
+
+
+def _extract_account_links(account_html: str) -> list[str]:
+    links: list[str] = []
+    for href in re.findall(r"href=['\"]([^'\"]+)['\"]", account_html, flags=re.IGNORECASE):
+        href_lower = href.lower()
+        if "logout" in href_lower or "clearsession" in href_lower:
+            continue
+        if "search/account" not in href_lower:
+            continue
+        if not any(token in href_lower for token in ("checkout", "hold", "dashboard", "account")):
+            continue
+        links.append(html.unescape(href))
+    return links
+
+
+def _extract_progressive_display_urls(account_html: str) -> list[str]:
+    urls: list[str] = []
+    for url in re.findall(
+        r'"url"\s*:\s*"([^\"]*account\.accountnonmobile\.[^\"]+)"',
+        account_html,
+        flags=re.IGNORECASE,
+    ):
+        decoded = html.unescape(url)
+        lower = decoded.lower()
+        if "librarycheckoutsaccordion" in lower or "libraryholdsaccordion" in lower:
+            urls.append(decoded)
+    return urls
+
+
+def _extract_sdcsrf_from_url(url: str) -> str | None:
+    match = re.search(r"[?&]sdcsrf=([a-f0-9-]+)", url, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_sdcsrf_from_html(account_html: str) -> str | None:
+    match = re.search(r"var\s+__sdcsrf\s*=\s*\"([a-f0-9-]+)\"", account_html, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _strip_sdcsrf_from_url(url: str) -> str:
+    stripped = re.sub(r"([?&])sdcsrf=[a-f0-9-]+", r"\1", url, flags=re.IGNORECASE)
+    stripped = re.sub(r"[?&]{2,}", "&", stripped)
+    stripped = stripped.replace("?&", "?")
+    if stripped.endswith("?") or stripped.endswith("&"):
+        stripped = stripped[:-1]
+    return stripped
+
+
+def _safe_page_name_from_url(url: str) -> str:
+    name = re.sub(r"https?://", "", url, flags=re.IGNORECASE)
+    name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+    if not name:
+        return "page"
+    return name[:120]
+
+
+def _debug_dump_html(name: str, content: str) -> None:
+    target_dir = os.getenv("LINKCAT_DEBUG_HTML_DIR", "").strip()
+    if not target_dir:
+        return
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, f"{name}.html")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        _LOGGER.debug("Wrote Linkcat debug HTML to %s", path)
+    except Exception:
+        _LOGGER.debug("Failed writing Linkcat debug HTML for %s", name, exc_info=True)
+
+
+def _is_system_error_page(page_html: str) -> bool:
+    lowered = page_html.lower()
+    return "id=\"exceptionblock\"" in lowered and "system error" in lowered
+
+
+def _extract_html_fragments(page_html: str) -> list[str]:
+    fragments = [_normalize_html_fragment(page_html)]
+
+    stripped = page_html.lstrip()
+    if not stripped.startswith("{"):
+        return fragments
+
+    try:
+        payload = json.loads(page_html)
+    except Exception:
+        return fragments
+
+    if not isinstance(payload, dict):
+        return fragments
+
+    for key in ("content",):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(_normalize_html_fragment(value))
+
+    zones = payload.get("zones")
+    if isinstance(zones, dict):
+        for zone_html in zones.values():
+            if isinstance(zone_html, str) and zone_html.strip():
+                fragments.append(_normalize_html_fragment(zone_html))
+
+    return fragments
+
+
+def _normalize_html_fragment(fragment: str) -> str:
+    normalized = html.unescape(fragment)
+    normalized = normalized.replace("\\/", "/")
+    normalized = normalized.replace("<\\", "<")
+    return normalized
