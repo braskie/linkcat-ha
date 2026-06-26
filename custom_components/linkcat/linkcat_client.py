@@ -164,6 +164,7 @@ class LinkcatClient:
         for page_html in pages:
             page_fragments.extend(_extract_html_fragments(page_html))
 
+        all_fragments_html = "\n".join(page_fragments)
         body_text = "\n".join(_html_to_text(fragment) for fragment in page_fragments)
 
         checkouts: list[CheckoutItem] = []
@@ -171,11 +172,16 @@ class LinkcatClient:
 
         for page_html in page_fragments:
             if not checkouts:
-                checkouts = _extract_checkout_rows(page_html, self._base_url)
+                checkouts = _extract_checkout_rows(page_html, self._base_url, allow_fallback=False)
             if not holds:
-                holds = _extract_hold_rows(page_html, self._base_url)
+                holds = _extract_hold_rows(page_html, self._base_url, allow_fallback=False)
             if checkouts and holds:
                 break
+
+        if not checkouts:
+            checkouts = _extract_checkout_rows(all_fragments_html, self._base_url, allow_fallback=True)
+        if not holds:
+            holds = _extract_hold_rows(all_fragments_html, self._base_url, allow_fallback=True)
 
         checkout_count = _extract_count(body_text, ["checkouts", "checked out", "items out"])
         hold_count = _extract_count(body_text, ["holds", "on hold"])
@@ -330,7 +336,7 @@ def _is_header_row(row_html: str) -> bool:
     return not bool(re.search(r"<td\b", row_html, re.IGNORECASE))
 
 
-def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutItem]:
+def _extract_checkout_rows(account_html: str, base_url: str, allow_fallback: bool = True) -> list[CheckoutItem]:
     table_html = _find_table(
         account_html,
         [
@@ -339,6 +345,7 @@ def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutIte
             "myCheckouts_checkoutslistnonmobile_table",
             "checkoutslistnonmobile_table",
         ],
+        ["checkoutslist", "checkoutslistnonmobile"],
     )
 
     checkouts: list[CheckoutItem] = []
@@ -392,13 +399,13 @@ def _extract_checkout_rows(account_html: str, base_url: str) -> list[CheckoutIte
             if title:
                 checkouts.append(CheckoutItem(title=title, author=author, image_url=image_url, due_date=due_date))
 
-    if not checkouts:
+    if allow_fallback and not checkouts:
         checkouts = _extract_checkout_links_fallback(account_html)
 
     return _dedupe_checkouts(checkouts)
 
 
-def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
+def _extract_hold_rows(account_html: str, base_url: str, allow_fallback: bool = True) -> list[HoldItem]:
     table_html = _find_table(
         account_html,
         [
@@ -406,9 +413,10 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
             "myHolds_holdslistnonmobile_table",
             "holdslistnonmobile_table",
         ],
+        ["holdslist", "holdslistnonmobile"],
     )
     if not table_html:
-        return _extract_hold_links_fallback(account_html)
+        return []
 
     holds: list[HoldItem] = []
     for row_html in _extract_table_rows(table_html):
@@ -456,9 +464,6 @@ def _extract_hold_rows(account_html: str, base_url: str) -> list[HoldItem]:
         if title and _TITLE_AUTHOR_HEADER_TEXT not in title.lower():
             holds.append(HoldItem(title=title, author=author, image_url=image_url, status=status, ready=ready))
 
-    if not holds:
-        holds = _extract_hold_links_fallback(account_html)
-
     return _dedupe_holds(holds)
 
 
@@ -484,8 +489,9 @@ def _extract_balanced_tag_content(html: str, tag: str, content_start: int) -> st
     return None
 
 
-def _find_table(account_html: str, id_hints: list[str]) -> str | None:
+def _find_table(account_html: str, id_hints: list[str], class_hints: list[str] | None = None) -> str | None:
     normalized_html = _normalize_html_fragment(account_html)
+    table_class_hints = class_hints or []
 
     for id_hint in id_hints:
         match = re.search(
@@ -496,8 +502,7 @@ def _find_table(account_html: str, id_hints: list[str]) -> str | None:
         if match:
             return match.group(1)
 
-    class_hints = ["checkoutslist", "holdslist", "detailitemtable"]
-    for class_hint in class_hints:
+    for class_hint in table_class_hints:
         match = re.search(
             rf"<table[^>]*class=['\"][^'\"]*{class_hint}[^'\"]*['\"][^>]*>(.*?)</table>",
             normalized_html,
@@ -549,17 +554,35 @@ def _extract_image_url(fragment_html: str, base_url: str) -> str | None:
     fragment_html = _normalize_html_fragment(fragment_html)
 
     cover_match = re.search(
-        r"<img\b[^>]*(?:class=['\"][^'\"]*accountCoverImage[^'\"]*['\"]|id=['\"][^'\"]*(?:checkoutsImage|holdsImage)[^'\"]*['\"])[^>]*\bsrc=['\"]([^'\"]+)['\"]",
+        r"<img\b[^>]*class=['\"][^'\"]*accountCoverImage[^'\"]*['\"][^>]*\bsrc=['\"]([^'\"]+)['\"]",
         fragment_html,
         flags=re.IGNORECASE,
     )
     if cover_match:
-        return urljoin(base_url, html.unescape(cover_match.group(1)).strip())
+        candidate = urljoin(base_url, html.unescape(cover_match.group(1)).strip())
+        if not _is_generic_account_icon(candidate):
+            return candidate
 
-    image_match = re.search(r"<img\b[^>]*\bsrc=['\"]([^'\"]+)['\"]", fragment_html, flags=re.IGNORECASE)
-    if not image_match:
-        return None
-    return urljoin(base_url, html.unescape(image_match.group(1)).strip())
+    for img_tag in re.findall(r"<img\b[^>]*>", fragment_html, flags=re.IGNORECASE):
+        src = _extract_attr(img_tag, "src") or _extract_attr(img_tag, "data-src") or _extract_attr(img_tag, "data-original")
+        if not src:
+            continue
+        candidate = urljoin(base_url, src)
+        if _is_generic_account_icon(candidate):
+            continue
+        return candidate
+
+    return None
+
+
+def _is_generic_account_icon(url: str) -> bool:
+    lowered = url.lower()
+    return (
+        "/images/account-icons/" in lowered
+        or lowered.endswith("/spacer.gif")
+        or "core/spacer.gif" in lowered
+        or lowered.endswith("/no_image.png")
+    )
 
 
 def _extract_due_date(text: str) -> str | None:
